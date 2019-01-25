@@ -26,6 +26,8 @@ import re
 import six
 import tensorflow as tf
 
+from common import FLAGS
+
 
 class BertConfig(object):
   """Configuration for `BertModel`."""
@@ -335,7 +337,11 @@ def get_assignment_map_from_checkpoint(tvars, init_checkpoint):
     (name, var) = (x[0], x[1])
     if name not in name_to_variable:
       continue
-    assignment_map[name] = name
+
+    if FLAGS.use_tpu:
+        assignment_map[name] = name
+    else:
+        assignment_map[name] = name_to_variable[name]
     initialized_variable_names[name] = 1
     initialized_variable_names[name + ":0"] = 1
 
