@@ -604,9 +604,9 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                     "eval_loss": loss,
                 }
 
-            eval_metrics = (metric_fn,
-                            [per_example_loss, label_ids, logits, is_real_example])
             if FLAGS.use_tpu:
+                eval_metrics = (metric_fn,
+                                [per_example_loss, label_ids, logits, is_real_example])
                 output_spec = tf.contrib.tpu.TPUEstimatorSpec(
                     mode=mode,
                     loss=total_loss,
@@ -616,7 +616,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                 output_spec = tf.estimator.EstimatorSpec(
                     mode=mode,
                     loss=total_loss,
-                    eval_metrics=eval_metrics
+                    eval_metric_ops=metric_fn(per_example_loss, label_ids, logits, is_real_example)
                 )
         else:
             if FLAGS.use_tpu:
