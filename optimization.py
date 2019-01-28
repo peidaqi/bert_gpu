@@ -158,14 +158,48 @@ class AdamWeightDecayOptimizer2(optimizer_v2.OptimizerV2):
             state.zeros_slot(v, "m")
             state.zeros_slot(v, "v")
 
+    #
+    # Optimizer's distributed_apply will try to call each variable's processor
+    # and based on the type of variable, dense/sparse apply will be called.
+    #
+
     def _apply_dense(self, grad, var, state):
-        raise NotImplementedError()
+        #
+        # Here we simply replace scatter_add with addition
+        #
+        lr = state.get_hyper("learning_rate", var.dtype.base_dtype)
+        beta1_t = state.get_hyper("beta1", var.dtype.base_dtype)
+        beta2_t = state.get_hyper("beta2", var.dtype.base_dtype)
+        epsilon_t = state.get_hyper("epsilon", var.dtype.base_dtype)
+        weight_decay_rate = state.get_hyper('weight_decay_rate', var.dtype.base_dtype)
+        # lr = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
+        # m_t = beta1 * m + (1 - beta1) * g_t
+        m = state.get_slot(var, "m")
+        m_scaled_g_values = grad * (1 - beta1_t)
+        m_t = state_ops.assign(m, m * beta1_t, use_locking=self._use_locking)
+        m_t = m + m_scaled_g_values
+        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
+        v = state.get_slot(var, "v")
+        v_scaled_g_values = (grad * grad) * (1 - beta2_t)
+        v_t = state_ops.assign(v, v * beta2_t, use_locking=self._use_locking)
+        v_t = v + v_scaled_g_values
+        v_sqrt = math_ops.sqrt(v_t)
+        # var_update = state_ops.assign_sub(
+        #     var, lr * m_t / (v_sqrt + epsilon_t), use_locking=self._use_locking)
+        var_update = m_t / (v_sqrt + epsilon_t)
+        if self._do_use_weight_decay(self._get_variable_name(var.name)):
+            var_update += weight_decay_rate * var
+        update_with_lr = lr * var_update
+
+        var_update = state_ops.assign_sub(
+            var, update_with_lr, use_locking=self._use_locking)
+
+        return control_flow_ops.group(*[var_update, m_t, v_t])
 
     def _resource_apply_dense(self, grad, var, state):
-        raise NotImplementedError()
+        return self._apply_dense(grad, var, state)  # dense tensor of ResoureVariable should offer same API as Variable
 
     def _apply_sparse_shared(self, grad, var, indices, scatter_add, state):
-
         lr = state.get_hyper("learning_rate", var.dtype.base_dtype)
         beta1_t = state.get_hyper("beta1", var.dtype.base_dtype)
         beta2_t = state.get_hyper("beta2", var.dtype.base_dtype)
@@ -205,6 +239,10 @@ class AdamWeightDecayOptimizer2(optimizer_v2.OptimizerV2):
             state)
 
     def _resource_scatter_add(self, x, i, v):
+        #
+        # Daqi - handles incompatibility between the old Variable and new ResourceVariable. For now they refer to different C++ implementations.
+        # Future releases should see a merge of scatter_add and resource_scatter_add.
+        #
         with ops.control_dependencies(
                 [resource_variable_ops.resource_scatter_add(x.handle, i, v)]):
             return x.value()
