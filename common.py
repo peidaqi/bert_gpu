@@ -62,7 +62,7 @@ flags.DEFINE_float("num_train_epochs", 3.0,
                    "Total number of training epochs to perform.")
 
 flags.DEFINE_float(
-    "warmup_proportion", 0.0,  # Daqi: Turn off warmup for now
+    "warmup_proportion", 0.1,
     "Proportion of training to perform linear learning rate warmup for. "
     "E.g., 0.1 = 10% of training.")
 
