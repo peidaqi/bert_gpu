@@ -29,6 +29,8 @@ import tensorflow as tf
 from common import flags
 from common import FLAGS
 
+import timeit
+
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
 
@@ -763,7 +765,8 @@ def main(_):
                 num_shards=FLAGS.num_tpu_cores,
                 per_host_input_for_training=is_per_host))
     else:
-        distribution = tf.contrib.distribute.MirroredStrategy()  # Number of GPUs can be specified by num_gpus=number
+        distribution = tf.contrib.distribute.MirroredStrategy(num_gpus=FLAGS.num_gpus)
+        # distribution = tf.contrib.distribute.MirroredStrategy(devices=['/gpu:0', '/gpu:1'])  # Test single GPU.
         run_config = tf.estimator.RunConfig(train_distribute=distribution)
 
     train_examples = None
@@ -806,6 +809,8 @@ def main(_):
                 'predict_batch_size': FLAGS.predict_batch_size
             }
         )
+
+    start_timer = timeit.default_timer()
 
     if FLAGS.do_train:
         train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
@@ -916,6 +921,9 @@ def main(_):
                 num_written_lines += 1
         assert num_written_lines == num_actual_predict_examples
 
+    end_timer = timeit.default_timer()
+    tf.logging.info(f'Total model run time: {end_timer - start_timer}')
+    writer.write(f'Total model run time: {end_timer - start_timer}')
 
 if __name__ == "__main__":
     flags.mark_flag_as_required("data_dir")

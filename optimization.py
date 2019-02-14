@@ -12,27 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from tensorflow.python.training import training_ops
-from tensorflow.python.ops import state_ops
-from tensorflow.python.ops import resource_variable_ops
-from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.framework import ops
-"""Functions and classes related to optimization (weight updates)."""
-
-# from __future__ import absolute_import
-# from __future__ import division
-# from __future__ import print_function
-
 import re
 import tensorflow as tf
 
 from common import FLAGS
 from tensorflow.python.training import distribution_strategy_context
-from tensorflow.python.training.optimizer import get_filtered_grad_fn
-from tensorflow.python.eager import context
-from tensorflow.python.ops.gen_resource_variable_ops import resource_scatter_add
+from tensorflow.python.ops import resource_variable_ops
 from tensorflow.contrib.optimizer_v2 import optimizer_v2
+
 
 
 def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
@@ -106,7 +93,7 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
     (grads, _) = tf.clip_by_global_norm(grads, clip_norm=1.0)
 
     train_op = optimizer.apply_gradients(
-        zip(grads, tvars), global_step=None)
+        zip(grads, tvars), global_step=None) # We don't pass global_step here since it's updated using a separate op.
 
     # Normally the global step update is done inside of `apply_gradients`.
     # However, `AdamWeightDecayOptimizer` doesn't do this. But if you use
@@ -116,19 +103,13 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
     train_op = tf.group(train_op, [global_step.assign(new_global_step)])
     return train_op
 
-
-from tensorflow.python.eager import context
-from tensorflow.python.framework import ops
-from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import resource_variable_ops
-from tensorflow.python.ops import state_ops
-from tensorflow.python.training import optimizer
 from tensorflow.python.training import training_ops
-from tensorflow.python.util.tf_export import tf_export
-
-
-class AdamWeightDecayOptimizer4(optimizer.Optimizer):
+class AdamWeightDecayOptimizer4(tf.train.Optimizer):
+    """An implementation of the AdamWeightDecayOptimizer using tensorflow's standard Optimizer API.
+    This one uses the C++ TF ops for better performance
+    Inside the C++ Adam op implementation, there is:
+    $$lr_t := \text{learning\_rate} * \sqrt{1 - beta_2^t} / (1 - beta_1^t)$$
+    while the original BERT implementation doesn't have this. Therefore, it will be slightly different"""
 
     def __init__(self,
                  learning_rate=0.001,
@@ -140,23 +121,13 @@ class AdamWeightDecayOptimizer4(optimizer.Optimizer):
                  use_locking=False,
                  name='AdamWeightDecayOptimizer4'):
         super(AdamWeightDecayOptimizer4, self).__init__(use_locking, name)
-        self._lr = learning_rate
+
+        self._learning_rate = learning_rate
         self._beta1 = beta1
         self._beta2 = beta2
         self._epsilon = epsilon
         self._weight_decay_rate = weight_decay_rate
         self.exclude_from_weight_decay = exclude_from_weight_decay
-
-
-        # Tensor versions of the constructor arguments, created in _prepare().
-        self._lr_t = None
-        self._beta1_t = None
-        self._beta2_t = None
-        self._epsilon_t = None
-        self._weight_decay_rate_t = weight_decay_rate
-
-        # Created in SparseApply if needed.
-        self._updated_lr = None
 
     def _do_use_weight_decay(self, param_name):
         """Whether to use L2 weight decay for `param_name`."""
@@ -175,101 +146,67 @@ class AdamWeightDecayOptimizer4(optimizer.Optimizer):
             param_name = m.group(1)
         return param_name
 
-    # def _get_beta_accumulators(self):
-    #     with ops.init_scope():
-    #         if context.executing_eagerly():
-    #             graph = None
-    #         else:
-    #             graph = ops.get_default_graph()
-    #         return (self._get_non_slot_variable("beta1_power", graph=graph),
-    #                 self._get_non_slot_variable("beta2_power", graph=graph))
-
     def _create_slots(self, var_list):
-        # first_var = min(var_list, key=lambda x: x.name)
-        # self._create_non_slot_variable(initial_value=self._beta1,
-        #                                name="beta1_power",
-        #                                colocate_with=first_var)
-        # self._create_non_slot_variable(initial_value=self._beta2,
-        #                                name="beta2_power",
-        #                                colocate_with=first_var)
+        # Create slots for the first and second moments.
         for v in var_list:
             self._zeros_slot(v, "m", self._name)
             self._zeros_slot(v, "v", self._name)
 
-    def _prepare(self):
-        lr = self._call_if_callable(self._lr)
-        beta1 = self._call_if_callable(self._beta1)
-        beta2 = self._call_if_callable(self._beta2)
-        epsilon = self._call_if_callable(self._epsilon)
-        weight_decay_rate = self._call_if_callable(self._weight_decay_rate)
-
-        self._lr_t = ops.convert_to_tensor(lr, name="learning_rate")
-        self._beta1_t = ops.convert_to_tensor(beta1, name="beta1")
-        self._beta2_t = ops.convert_to_tensor(beta2, name="beta2")
-        self._epsilon_t = ops.convert_to_tensor(epsilon, name="epsilon")
-        self._weight_decay_rate_t = ops.convert_to_tensor(weight_decay_rate, name='weight_decay_rate')
-
-    def _apply_dense_shared(self, grad, var):
-        lr_t = math_ops.cast(self._lr_t, var.dtype.base_dtype)
-        beta1_t = math_ops.cast(self._beta1_t, var.dtype.base_dtype)
-        beta2_t = math_ops.cast(self._beta2_t, var.dtype.base_dtype)
-        epsilon_t = math_ops.cast(self._epsilon_t, var.dtype.base_dtype)
-
-        m = self.get_slot(var, "m")
-        v = self.get_slot(var, "v")
-        next_m = (tf.multiply(beta1_t, m) + tf.multiply(1.0 - beta1_t, grad))
-        next_v = (tf.multiply(beta2_t, v) + tf.multiply(1.0 - beta2_t, tf.square(grad)))
-        update = next_m / (tf.sqrt(next_v) + epsilon_t)
-
-        if self._do_use_weight_decay(self._get_variable_name(var.name)):
-            update += self._weight_decay_rate_t * var
-
-        update_with_lr = lr_t * update # use lr_t directly without beta accumulation
-        next_var = var - update_with_lr
-
-        return control_flow_ops.group(*[var.assign(next_var), m.assign(next_m), v.assign(next_v)])
+    #
+    # In the base class, distributed_apply will try to call each variable's processor.
+    # And depends on the type of the variable, the dense/sparse/resource versions of apply will be executed.
+    # ResourceVariable is the new Variable implementation, which will replace the old one in TF 2.0
+    #
 
     def _apply_dense(self, grad, var):
-        return self._apply_dense_shared(grad, var)
+        m = self.get_slot(var, "m")
+        v = self.get_slot(var, "v")
+        decayed_var = var
+        if self._do_use_weight_decay(self._get_variable_name(var.name)):
+            decayed_var = self._weight_decay_rate * var
+        return training_ops.apply_adam(
+            decayed_var, m, v,
+            tf.cast(self._beta1, var.dtype.base_dtype),
+            tf.cast(self._beta2, var.dtype.base_dtype),
+            tf.cast(self._learning_rate, var.dtype.base_dtype),
+            tf.cast(self._beta1, var.dtype.base_dtype),
+            tf.cast(self._beta2, var.dtype.base_dtype),
+            tf.cast(self._epsilon, var.dtype.base_dtype),
+            grad, use_locking=self._use_locking).op
 
     def _resource_apply_dense(self, grad, var):
-        return self._apply_dense_shared(grad, var)
+        m = self.get_slot(var, "m")
+        v = self.get_slot(var, "v")
+        decayed_var = var
+        if self._do_use_weight_decay(self._get_variable_name(var.name)):
+            decayed_var = self._weight_decay_rate * var
+        return training_ops.resource_apply_adam(
+            decayed_var, m, v,
+            tf.cast(self._beta1, var.dtype.base_dtype),
+            tf.cast(self._beta2, var.dtype.base_dtype),
+            tf.cast(self._learning_rate, var.dtype.base_dtype),
+            tf.cast(self._beta1, var.dtype.base_dtype),
+            tf.cast(self._beta2, var.dtype.base_dtype),
+            tf.cast(self._epsilon, var.dtype.base_dtype),
+            grad, use_locking=self._use_locking).op
 
     def _apply_sparse_shared(self, grad, var, indices, scatter_add):
-        # beta1_power, beta2_power = self._get_beta_accumulators()
-        # beta1_power = math_ops.cast(beta1_power, var.dtype.base_dtype)
-        # beta2_power = math_ops.cast(beta2_power, var.dtype.base_dtype)
-        lr_t = math_ops.cast(self._lr_t, var.dtype.base_dtype)
-        beta1_t = math_ops.cast(self._beta1_t, var.dtype.base_dtype)
-        beta2_t = math_ops.cast(self._beta2_t, var.dtype.base_dtype)
-        epsilon_t = math_ops.cast(self._epsilon_t, var.dtype.base_dtype)
-        # lr = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
-        # m_t = beta1 * m + (1 - beta1) * g_t
         m = self.get_slot(var, "m")
-        m_scaled_g_values = grad * (1 - beta1_t)
-        m_t = state_ops.assign(m, m * beta1_t,
-                               use_locking=self._use_locking)
-        with ops.control_dependencies([m_t]):
-            m_t = scatter_add(m, indices, m_scaled_g_values)
-        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
+        m_t = tf.assign(m, m * self._beta1, use_locking=self._use_locking)
+        m_t = scatter_add(m, indices, grad * (1 - self._beta1))
+
         v = self.get_slot(var, "v")
-        v_scaled_g_values = (grad * grad) * (1 - beta2_t)
-        v_t = state_ops.assign(v, v * beta2_t, use_locking=self._use_locking)
-        with ops.control_dependencies([v_t]):
-            v_t = scatter_add(v, indices, v_scaled_g_values)
-        v_sqrt = math_ops.sqrt(v_t)
+        v_t = tf.assign(v, v * self._beta2, use_locking=self._use_locking)
+        v_t = scatter_add(v, indices, (grad * grad) * (1 - self._beta2))
 
-        update = m_t / (v_sqrt + epsilon_t) 
+        update = m_t / (tf.sqrt(v_t) + self._epsilon)
         if self._do_use_weight_decay(self._get_variable_name(var.name)):
-            update += self._weight_decay_rate_t * var
+            update += self._weight_decay_rate * var
+        update_with_lr = self._learning_rate * update
 
-        update_with_lr = lr_t * update # use lr_t directly without beta accumulation
-        var_update = state_ops.assign_sub(var, update_with_lr, use_locking=self._use_locking)
+        var_update = tf.assign_sub(var, update_with_lr, use_locking=self._use_locking)
 
-        # var_update = state_ops.assign_sub(var,
-        #                                   lr * m_t / (v_sqrt + epsilon_t),
-        #                                   use_locking=self._use_locking)
-        return control_flow_ops.group(*[var_update, m_t, v_t])
+        return tf.group(*[var_update, m_t, v_t])
 
     def _apply_sparse(self, grad, var):
         return self._apply_sparse_shared(
@@ -278,30 +215,22 @@ class AdamWeightDecayOptimizer4(optimizer.Optimizer):
                 x, i, v, use_locking=self._use_locking))
 
     def _resource_scatter_add(self, x, i, v):
-        with ops.control_dependencies(
-            [resource_variable_ops.resource_scatter_add(
-                x.handle, i, v)]):
+        #
+        # We use x.handle for ResourceVariables.
+        # resource_scatter_add and scatter_add refer to different ops in C++.
+        #
+        with tf.control_dependencies(
+                [resource_variable_ops.resource_scatter_add(x.handle, i, v)]):
             return x.value()
 
     def _resource_apply_sparse(self, grad, var, indices):
-        return self._apply_sparse_shared(
-            grad, var, indices, self._resource_scatter_add)
+        return self._apply_sparse_shared(grad, var, indices,
+                                         self._resource_scatter_add)
 
-    # def _finish(self, update_ops, name_scope):
-    #     # Update the power accumulators.
-    #     with ops.control_dependencies(update_ops):
-    #         beta1_power, beta2_power = self._get_beta_accumulators()
-    #         with ops.colocate_with(beta1_power):
-    #             update_beta1 = beta1_power.assign(
-    #                 beta1_power * self._beta1_t, use_locking=self._use_locking)
-    #             update_beta2 = beta2_power.assign(
-    #                 beta2_power * self._beta2_t, use_locking=self._use_locking)
-    #     return control_flow_ops.group(*update_ops + [update_beta1, update_beta2],
-    #                                   name=name_scope)
 
 
 class AdamWeightDecayOptimizer3(tf.train.Optimizer):
-
+    """An implementation of the AdamWeightDecayOptimizer using tensorflow's standard Optimizer API."""
     def __init__(self,
                  learning_rate=0.001,
                  weight_decay_rate=0.0,
@@ -313,11 +242,6 @@ class AdamWeightDecayOptimizer3(tf.train.Optimizer):
                  name='AdamWeightDecayOptimizer3'):
         super(AdamWeightDecayOptimizer3, self).__init__(use_locking, name)
 
-        # self._set_hyper('learning_rate', learning_rate)
-        # self._set_hyper('beta1', beta1)
-        # self._set_hyper('beta2', beta2)
-        # self._set_hyper('epsilon', epsilon)
-        # self._set_hyper('weight_decay_rate', weight_decay_rate)
         self._learning_rate = learning_rate
         self._beta1 = beta1
         self._beta2 = beta2
@@ -327,8 +251,8 @@ class AdamWeightDecayOptimizer3(tf.train.Optimizer):
 
     def _do_use_weight_decay(self, param_name):
         """Whether to use L2 weight decay for `param_name`."""
-        # if not self.weight_decay_rate:
-        #     return False
+        if not self._weight_decay_rate:
+            return False
         if self.exclude_from_weight_decay:
             for r in self.exclude_from_weight_decay:
                 if re.search(r, param_name) is not None:
@@ -342,112 +266,59 @@ class AdamWeightDecayOptimizer3(tf.train.Optimizer):
             param_name = m.group(1)
         return param_name
 
-    def _get_non_slot(self, name):
-        with ops.init_scope():
-            if context.executing_eagerly():
-                graph = None
-            else:
-                graph = ops.get_default_graph()
-            return self._get_non_slot_variable(name, graph=graph)
-
     def _create_slots(self, var_list):
-        first_var = min(var_list, key=lambda x: x.name)
-        self._create_non_slot_variable(initial_value=self._beta1,
-                                       name="beta1",
-                                       colocate_with=first_var)
-        self._create_non_slot_variable(initial_value=self._beta2,
-                                       name="beta2",
-                                       colocate_with=first_var)
-        self._create_non_slot_variable(initial_value=self._epsilon,
-                                       name="epsilon",
-                                       colocate_with=first_var)
-        self._create_non_slot_variable(initial_value=self._learning_rate,
-                                       name="learning_rate",
-                                       colocate_with=first_var)
-        self._create_non_slot_variable(initial_value=self._weight_decay_rate,
-                                       name="weight_decay_rate",
-                                       colocate_with=first_var)
-
         # Create slots for the first and second moments.
         for v in var_list:
             self._zeros_slot(v, "m", self._name)
             self._zeros_slot(v, "v", self._name)
 
     #
-    # Optimizer's distributed_apply will try to call each variable's processor
-    # and based on the type of variable, dense/sparse apply will be called.
+    # In the base class, distributed_apply will try to call each variable's processor.
+    # And depends on the type of the variable, the dense/sparse/resource versions of apply will be executed.
+    # ResourceVariable is the new Variable implementation, which will replace the old one in TF 2.0
     #
 
     def _apply_dense(self, grad, var):
         #
-        # Here we simply replace scatter_add with addition
+        # Code here gets lots of OOM. Recommended GPU memory >= 12GB.
+        # Mix of 8GB and 12GB GPUs will likely give OOM too. To avoid this problem, pass a smaller batch size in command line.
         #
-        lr = self._get_non_slot('learning_rate')
-        beta1_t = self._get_non_slot("beta1")
-        beta2_t = self._get_non_slot("beta2")
-        epsilon_t = self._get_non_slot("epsilon")
-        weight_decay_rate = self._get_non_slot('weight_decay_rate')
-        # lr = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
-        # m_t = beta1 * m + (1 - beta1) * g_t
         m = self.get_slot(var, "m")
-        m_scaled_g_values = grad * (1 - beta1_t)
-        m_t = state_ops.assign(m, m * beta1_t, use_locking=self._use_locking)
-        # with ops.control_dependencies([m_t]):
-        m_t = m + m_scaled_g_values
-        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
+        m_t = tf.multiply(m, self._beta1) + tf.multiply(grad, 1 - self._beta1)
+
         v = self.get_slot(var, "v")
-        v_scaled_g_values = (grad * grad) * (1 - beta2_t)
-        v_t = state_ops.assign(v, v * beta2_t, use_locking=self._use_locking)
-        # with ops.control_dependencies([v_t]):
-        v_t = v + v_scaled_g_values
-        v_sqrt = math_ops.sqrt(v_t)
-        # var_update = state_ops.assign_sub(
-        #     var, lr * m_t / (v_sqrt + epsilon_t), use_locking=self._use_locking)
-        update = m_t / (v_sqrt + epsilon_t)
+        v_t = tf.multiply(v, self._beta2) + tf.multiply(tf.square(grad), 1 - self._beta2)
+
+        update = m_t / (tf.sqrt(v_t) + self._epsilon)
         if self._do_use_weight_decay(self._get_variable_name(var.name)):
-            update += weight_decay_rate * var
-        update_with_lr = lr * update
+            update += self._weight_decay_rate * var
+        update_with_lr = self._learning_rate * update
 
-        var_update = state_ops.assign_sub(
-            var, update_with_lr, use_locking=self._use_locking)
+        var_update = tf.assign_sub(var, update_with_lr, use_locking=self._use_locking)
 
-        return control_flow_ops.group(*[var_update, m_t, v_t])
+        return tf.group(*[var_update, tf.assign(m, m_t), tf.assign(v, v_t)])
 
     def _resource_apply_dense(self, grad, var):
-        # dense tensor of ResoureVariable should offer same API as Variable
+        # Resource variable has similar API to old TF Variable.
         return self._apply_dense(grad, var)
 
     def _apply_sparse_shared(self, grad, var, indices, scatter_add):
-        lr = self._get_non_slot('learning_rate')
-        beta1_t = self._get_non_slot("beta1")
-        beta2_t = self._get_non_slot("beta2")
-        epsilon_t = self._get_non_slot("epsilon")
-        weight_decay_rate = self._get_non_slot('weight_decay_rate')
-        # lr = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
-        # m_t = beta1 * m + (1 - beta1) * g_t
         m = self.get_slot(var, "m")
-        m_scaled_g_values = grad * (1 - beta1_t)
-        m_t = state_ops.assign(m, m * beta1_t, use_locking=self._use_locking)
-        with ops.control_dependencies([m_t]):
-            m_t = scatter_add(m, indices, m_scaled_g_values)
-        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
+        m_t = tf.assign(m, m * self._beta1, use_locking=self._use_locking)
+        m_t = scatter_add(m, indices, grad * (1 - self._beta1))
+
         v = self.get_slot(var, "v")
-        v_scaled_g_values = (grad * grad) * (1 - beta2_t)
-        v_t = state_ops.assign(v, v * beta2_t, use_locking=self._use_locking)
-        with ops.control_dependencies([v_t]):
-            v_t = scatter_add(v, indices, v_scaled_g_values)
-        v_sqrt = math_ops.sqrt(v_t)
-        # var_update = state_ops.assign_sub(
-        #     var, lr * m_t / (v_sqrt + epsilon_t), use_locking=self._use_locking)
-        update = m_t / (v_sqrt + epsilon_t)
+        v_t = tf.assign(v, v * self._beta2, use_locking=self._use_locking)
+        v_t = scatter_add(v, indices, (grad * grad) * (1 - self._beta2))
+
+        update = m_t / (tf.sqrt(v_t) + self._epsilon)
         if self._do_use_weight_decay(self._get_variable_name(var.name)):
-            update += weight_decay_rate * var
-        update_with_lr = lr * update
+            update += self._weight_decay_rate * var
+        update_with_lr = self._learning_rate * update
 
-        var_update = state_ops.assign_sub(
-            var, update_with_lr, use_locking=self._use_locking)
+        var_update = tf.assign_sub(var, update_with_lr, use_locking=self._use_locking)
 
-        return control_flow_ops.group(*[var_update, m_t, v_t])
+        return tf.group(*[var_update, m_t, v_t])
 
     def _apply_sparse(self, grad, var):
         return self._apply_sparse_shared(
@@ -457,10 +328,10 @@ class AdamWeightDecayOptimizer3(tf.train.Optimizer):
 
     def _resource_scatter_add(self, x, i, v):
         #
-        # Daqi - handles incompatibility between the old Variable and new ResourceVariable. For now they refer to different C++ implementations.
-        # Future releases should see a merge of scatter_add and resource_scatter_add.
+        # We use x.handle for ResourceVariables.
+        # resource_scatter_add and scatter_add refer to different ops in C++.
         #
-        with ops.control_dependencies(
+        with tf.control_dependencies(
                 [resource_variable_ops.resource_scatter_add(x.handle, i, v)]):
             return x.value()
 
@@ -470,7 +341,8 @@ class AdamWeightDecayOptimizer3(tf.train.Optimizer):
 
 
 class AdamWeightDecayOptimizer2(optimizer_v2.OptimizerV2):
-
+    """An implementation of the AdamWeightDecayOptimizer using tensorflow's newer OptimizerV2 API."""
+    """However, there seems to be some incompatibility issues between OptimizerV2 and tf.distribute, which reports a duplicated node name error in runtime."""
     def __init__(self,
                  learning_rate=0.001,
                  weight_decay_rate=0.0,
@@ -522,34 +394,28 @@ class AdamWeightDecayOptimizer2(optimizer_v2.OptimizerV2):
         # Here we simply replace scatter_add with addition
         #
         lr = state.get_hyper("learning_rate", var.dtype.base_dtype)
-        beta1_t = state.get_hyper("beta1", var.dtype.base_dtype)
-        beta2_t = state.get_hyper("beta2", var.dtype.base_dtype)
-        epsilon_t = state.get_hyper("epsilon", var.dtype.base_dtype)
-        weight_decay_rate = state.get_hyper(
-            'weight_decay_rate', var.dtype.base_dtype)
-        # lr = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
-        # m_t = beta1 * m + (1 - beta1) * g_t
-        m = state.get_slot(var, "m")
-        m_scaled_g_values = grad * (1 - beta1_t)
-        m_t = state_ops.assign(m, m * beta1_t, use_locking=self._use_locking)
-        m_t = m + m_scaled_g_values
-        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
-        v = state.get_slot(var, "v")
-        v_scaled_g_values = (grad * grad) * (1 - beta2_t)
-        v_t = state_ops.assign(v, v * beta2_t, use_locking=self._use_locking)
-        v_t = v + v_scaled_g_values
-        v_sqrt = math_ops.sqrt(v_t)
-        # var_update = state_ops.assign_sub(
-        #     var, lr * m_t / (v_sqrt + epsilon_t), use_locking=self._use_locking)
-        var_update = m_t / (v_sqrt + epsilon_t)
+        beta1 = state.get_hyper("beta1", var.dtype.base_dtype)
+        beta2 = state.get_hyper("beta2", var.dtype.base_dtype)
+        epsilon = state.get_hyper("epsilon", var.dtype.base_dtype)
+        weight_decay_rate = state.get_hyper('weight_decay_rate', var.dtype.base_dtype)
+        #
+        # Code here gets lots of OOM. Recommended GPU memory >= 12GB.
+        # Mix of 8GB and 12GB GPUs will likely give OOM too. To avoid this problem, pass a smaller batch size in command line.
+        #
+        m = self.get_slot(var, "m")
+        m_t = tf.multiply(m, beta1) + tf.multiply(grad, 1 - beta1)
+
+        v = self.get_slot(var, "v")
+        v_t = tf.multiply(v, beta2) + tf.multiply(tf.square(grad), 1 - beta2)
+
+        update = m_t / (tf.sqrt(v_t) + epsilon)
         if self._do_use_weight_decay(self._get_variable_name(var.name)):
-            var_update += weight_decay_rate * var
-        update_with_lr = lr * var_update
+            update += self._weight_decay_rate * var
+        update_with_lr = lr * update
 
-        var_update = state_ops.assign_sub(
-            var, update_with_lr, use_locking=self._use_locking)
+        var_update = tf.assign_sub(var, update_with_lr, use_locking=self._use_locking)
 
-        return control_flow_ops.group(*[var_update, m_t, v_t])
+        return tf.group(*[var_update, tf.assign(m, m_t), tf.assign(v, v_t)])
 
     def _resource_apply_dense(self, grad, var, state):
         # dense tensor of ResoureVariable should offer same API as Variable
@@ -557,36 +423,26 @@ class AdamWeightDecayOptimizer2(optimizer_v2.OptimizerV2):
 
     def _apply_sparse_shared(self, grad, var, indices, scatter_add, state):
         lr = state.get_hyper("learning_rate", var.dtype.base_dtype)
-        beta1_t = state.get_hyper("beta1", var.dtype.base_dtype)
-        beta2_t = state.get_hyper("beta2", var.dtype.base_dtype)
-        epsilon_t = state.get_hyper("epsilon", var.dtype.base_dtype)
-        weight_decay_rate = state.get_hyper(
-            'weight_decay_rate', var.dtype.base_dtype)
-        # lr = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
-        # m_t = beta1 * m + (1 - beta1) * g_t
-        m = state.get_slot(var, "m")
-        m_scaled_g_values = grad * (1 - beta1_t)
-        m_t = state_ops.assign(m, m * beta1_t, use_locking=self._use_locking)
-        with ops.control_dependencies([m_t]):
-            m_t = scatter_add(m, indices, m_scaled_g_values)
-        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
-        v = state.get_slot(var, "v")
-        v_scaled_g_values = (grad * grad) * (1 - beta2_t)
-        v_t = state_ops.assign(v, v * beta2_t, use_locking=self._use_locking)
-        with ops.control_dependencies([v_t]):
-            v_t = scatter_add(v, indices, v_scaled_g_values)
-        v_sqrt = math_ops.sqrt(v_t)
-        # var_update = state_ops.assign_sub(
-        #     var, lr * m_t / (v_sqrt + epsilon_t), use_locking=self._use_locking)
-        var_update = m_t / (v_sqrt + epsilon_t)
+        beta1 = state.get_hyper("beta1", var.dtype.base_dtype)
+        beta2 = state.get_hyper("beta2", var.dtype.base_dtype)
+        epsilon = state.get_hyper("epsilon", var.dtype.base_dtype)
+        weight_decay_rate = state.get_hyper('weight_decay_rate', var.dtype.base_dtype)
+        m = self.get_slot(var, "m")
+        m_t = tf.assign(m, m * beta1, use_locking=self._use_locking)
+        m_t = scatter_add(m, indices, grad * (1 - beta1))
+
+        v = self.get_slot(var, "v")
+        v_t = tf.assign(v, v * beta2, use_locking=self._use_locking)
+        v_t = scatter_add(v, indices, (grad * grad) * (1 - beta2))
+
+        update = m_t / (tf.sqrt(v_t) + epsilon)
         if self._do_use_weight_decay(self._get_variable_name(var.name)):
-            var_update += weight_decay_rate * var
-        update_with_lr = lr * var_update
+            update += self._weight_decay_rate * var
+        update_with_lr = lr * update
 
-        var_update = state_ops.assign_sub(
-            var, update_with_lr, use_locking=self._use_locking)
+        var_update = tf.assign_sub(var, update_with_lr, use_locking=self._use_locking)
 
-        return control_flow_ops.group(*[var_update, m_t, v_t])
+        return tf.group(*[var_update, m_t, v_t])
 
     def _apply_sparse(self, grad, var, state):
         return self._apply_sparse_shared(
@@ -600,7 +456,7 @@ class AdamWeightDecayOptimizer2(optimizer_v2.OptimizerV2):
         # Daqi - handles incompatibility between the old Variable and new ResourceVariable. For now they refer to different C++ implementations.
         # Future releases should see a merge of scatter_add and resource_scatter_add.
         #
-        with ops.control_dependencies(
+        with tf.control_dependencies(
                 [resource_variable_ops.resource_scatter_add(x.handle, i, v)]):
             return x.value()
 
